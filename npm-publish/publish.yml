@@ -1,0 +1,147 @@
+name: npm-publish
+
+# Manually triggered publish pipeline.
+# Bumps the package version (patch / minor / major), runs the project's
+# lifecycle scripts when present, publishes to the npm registry, then tags
+# and creates a GitHub Release.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semver bump level to publish"
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+# Needed so the GitHub CLI / git can push the bump commit, the tag and the release.
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      # npm automation token used for publishing (set in repo/org secrets).
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # GitHub token for `gh` (the default GITHUB_TOKEN is fine for releases).
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      NPM_REGISTRY: "https://registry.npmjs.org"
+
+    steps:
+      # 1. Checkout codebase (full history so tagging works).
+      - name: Checkout codebase
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # 2. Install GitHub CLI (preinstalled on ubuntu runners; ensure present).
+      - name: Install GitHub CLI
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            type -p curl >/dev/null || sudo apt-get install -y curl
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+              | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+              | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+
+      # 3. Install Node.js.
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      # 4. Verify tool versions.
+      - name: Verify tool versions
+        run: |
+          echo "GitHub CLI:"
+          gh --version
+          echo "Node.js: $(node --version)"
+          echo "npm:     $(npm --version)"
+
+      # 5. Create .npmrc with the registry + auth token.
+      #    Written at publish time and never committed (see steps 9/11).
+      - name: Create .npmrc
+        run: |
+          {
+            echo "registry=${NPM_REGISTRY}"
+            echo "//registry.npmjs.org/:_authToken=\${NPM_TOKEN}"
+            echo "always-auth=true"
+          } > .npmrc
+          echo "Created .npmrc (token redacted):"
+          sed 's/_authToken=.*/_authToken=***REDACTED***/' .npmrc
+
+      # 6. Install dependencies.
+      - name: npm install
+        run: npm install
+
+      # 7. npm list (only if there is anything to list; non-fatal).
+      - name: npm list
+        run: npm list --depth=0 || true
+
+      # 8. npm test (only if a "test" script is defined).
+      - name: npm test
+        run: |
+          if npm run | grep -qE '^[[:space:]]+test$'; then
+            npm test
+          else
+            echo "No \"test\" script defined — skipping."
+          fi
+
+      # 9. npm build (only if a "build" script is defined).
+      - name: npm build
+        run: |
+          if npm run | grep -qE '^[[:space:]]+build$'; then
+            npm run build
+          else
+            echo "No \"build\" script defined — skipping."
+          fi
+
+      # 10. Bump the version (creates the version commit, no git tag yet).
+      - name: Bump version
+        id: bump
+        run: |
+          # Bump without creating a git tag here; we tag explicitly later.
+          NEW_VERSION="$(npm version ${{ github.event.inputs.version }} --no-git-tag-version)"
+          echo "Bumped to ${NEW_VERSION}"
+          echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+
+      # 11. Publish to the npm registry using the token, ignoring scripts.
+      #     --userconfig points at our generated .npmrc explicitly.
+      - name: Publish to npm
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --userconfig ./.npmrc --ignore-scripts --access public
+
+      # 12. Tag and create the GitHub Release (never staging .npmrc).
+      - name: Tag and create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.bump.outputs.version }}"
+
+          # Make sure .npmrc is never staged or committed.
+          rm -f .npmrc
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage only package manifest changes from the version bump.
+          git add package.json package-lock.json npm-shrinkwrap.json 2>/dev/null || true
+          git commit -m "chore(release): ${VERSION}" || echo "Nothing to commit."
+
+          git tag -a "${VERSION}" -m "Release ${VERSION}"
+          git push origin HEAD --follow-tags
+
+          gh release create "${VERSION}" \
+            --title "${VERSION}" \
+            --generate-notes
